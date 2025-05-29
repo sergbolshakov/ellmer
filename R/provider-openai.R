@@ -118,6 +118,10 @@ method(base_request, ProviderOpenAI) <- function(provider) {
   req <- req_auth_bearer_token(req, provider@api_key)
   req <- req_retry(req, max_tries = 2)
   req <- ellmer_req_timeout(req, stream)
+  proxy_url <- Sys.getenv("HTTPS_PROXY", unset = NA_character_)
+  if (!is.na(proxy_url) && nzchar(proxy_url)) {
+  req <- req_proxy(req, url = proxy_url, auth = "gssnegotiate")
+  }
   req <- ellmer_req_user_agent(req)
   req <- base_request_error(provider, req)
   req
