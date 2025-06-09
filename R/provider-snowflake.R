@@ -23,8 +23,7 @@ NULL
 #'   package.
 #'
 #' ## Known limitations
-#' Note that Snowflake-hosted models do not support images, tool calling, or
-#' structured outputs.
+#' Note that Snowflake-hosted models do not support images.
 #'
 #' See [chat_cortex_analyst()] to chat with the Snowflake Cortex Analyst rather
 #' than a general-purpose model.
@@ -42,11 +41,13 @@ chat_snowflake <- function(
   account = snowflake_account(),
   credentials = NULL,
   model = NULL,
+  params = NULL,
   api_args = list(),
   echo = c("none", "output", "all")
 ) {
   check_string(account, allow_empty = FALSE)
   model <- set_default(model, "claude-3-7-sonnet")
+  params <- params %||% params()
   echo <- check_echo(echo)
 
   if (is_list(credentials)) {
@@ -62,6 +63,7 @@ chat_snowflake <- function(
     account = account,
     credentials = credentials,
     model = model,
+    params = params,
     extra_args = api_args,
     # We need an empty api_key for S7 validation.
     api_key = ""
@@ -107,40 +109,237 @@ method(chat_body, ProviderSnowflakeCortex) <- function(
   tools = list(),
   type = NULL
 ) {
-  call <- quote(chat_snowflake())
-  if (length(tools) != 0) {
-    cli::cli_abort("Tool calling is not supported.", call = call)
-  }
-  if (!is.null(type) != 0) {
-    cli::cli_abort("Structured data extraction is not supported.", call = call)
+  messages <- as_json(provider, turns)
+  tools <- as_json(provider, unname(tools))
+
+  if (!is.null(type)) {
+    # Note: Snowflake uses a slightly different format than OpenAI.
+    response_format <- list(type = "json", schema = as_json(provider, type))
+  } else {
+    response_format <- NULL
   }
 
-  messages <- as_json(provider, turns)
-  list(
+  params <- chat_params(provider, provider@params)
+  compact(list2(
     messages = messages,
     model = provider@model,
-    stream = stream
+    !!!params,
+    stream = stream,
+    tools = tools,
+    response_format = response_format
+  ))
+}
+
+method(as_json, list(ProviderSnowflakeCortex, TypeObject)) <- function(
+  provider,
+  x
+) {
+  # Unlike OpenAI, Snowflake does not support the "additionalProperties" field.
+  names <- names2(x@properties)
+  required <- map_lgl(x@properties, function(prop) prop@required)
+  properties <- as_json(provider, x@properties)
+  names(properties) <- names
+  list(
+    type = "object",
+    description = x@description %||% "",
+    properties = properties,
+    required = as.list(names[required])
+  )
+}
+
+# See: https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-llm-rest-api#optional-json-arguments
+method(chat_params, ProviderSnowflakeCortex) <- function(provider, params) {
+  standardise_params(
+    params,
+    c(
+      temperature = "temperature",
+      top_p = "top_p",
+      max_tokens = "max_tokens"
+    )
   )
 }
 
 # Snowflake -> ellmer --------------------------------------------------------
 
+method(stream_merge_chunks, ProviderSnowflakeCortex) <- function(
+  provider,
+  result,
+  chunk
+) {
+  # We're aiming to make Snowflake's chunk format look the same as their non-
+  # chunked format here so downstream processing logic can be uniform. We are
+  # *not* trying to make it more sane.
+  if (is.null(result)) {
+    # Avoid multiple encodings for text content.
+    if (chunk$choices[[1]]$delta$type == "text") {
+      chunk$choices[[1]]$delta$type <- NULL
+      chunk$choices[[1]]$delta$text <- NULL
+    }
+    # Non-streaming responses use "message" instead of "delta".
+    chunk$choices[[1]]$message <- chunk$choices[[1]]$delta
+    chunk$choices[[1]]$delta <- NULL
+    return(chunk)
+  }
+  # Note: most fields are immutable between chunks and we can ignored updates.
+  # We only care about changes to `choices[[1]]$delta` and `usage`.
+  #
+  # Note also: there is no index support in Snowflake's chunk format, so we're
+  # always assuming we can operate on the first one, except in the special
+  # case of tool calls.
+  current <- result$choices[[1]]$message
+  delta <- chunk$choices[[1]]$delta
+  if (delta$type == "text") {
+    paste(current$content_list[[1]]$text) <- delta$text
+    current[["content"]] <- current$content_list[[1]]$text
+  } else if (delta$type == "tool_use") {
+    # When we get a tool call, we need to append a second entry to the content
+    # list (again, since there is no index tracking).
+    if (length(current$content_list) == 1) {
+      current$content_list[[2]] <- list(
+        type = "tool_use",
+        tool_use = list(
+          tool_use_id = delta$tool_use_id,
+          name = delta$name,
+          input = delta$input
+        )
+      )
+    } else {
+      # Otherwise we're appending to existing input.
+      paste(current$content_list[[2]]$tool_use$input) <- delta$input
+    }
+  } else {
+    cli::cli_abort(
+      "Unsupported content type {.str {delta$type}}.",
+      .internal = TRUE
+    )
+  }
+  result$choices[[1]]$message <- current
+  result$usage <- chunk$usage
+  result
+}
+
+method(value_turn, ProviderSnowflakeCortex) <- function(
+  provider,
+  result,
+  has_type = FALSE
+) {
+  raw_content <- result$choices[[1]]$message$content_list
+  contents <- lapply(raw_content, function(content) {
+    if (content$type == "text") {
+      if (has_type) {
+        ContentJson(jsonlite::parse_json(content$text))
+      } else {
+        ContentText(content$text)
+      }
+    } else if (content$type == "tool_use") {
+      content <- content$tool_use
+      if (is_string(content$input)) {
+        content$input <- jsonlite::parse_json(content$input)
+      }
+      ContentToolRequest(
+        content$tool_use_id,
+        content$name,
+        content$input %||% list()
+      )
+    } else {
+      cli::cli_abort(
+        "Unknown content type {.str {content$type}}.",
+        .internal = TRUE
+      )
+    }
+  })
+  tokens <- tokens_log(
+    provider,
+    input = result$usage$prompt_tokens,
+    output = result$usage$completion_tokens
+  )
+  assistant_turn(contents, json = result, tokens = tokens)
+}
+
 # ellmer -> Snowflake --------------------------------------------------------
 
-# Snowflake only supports simple textual messages.
-
 method(as_json, list(ProviderSnowflakeCortex, Turn)) <- function(provider, x) {
+  # Attempting to omit the `content` field and use `content_list` instead
+  # yields:
+  #
+  # > messages[0].content cannot be empty string (was '')
+  #
+  # So we emulate what Snowflake do and put the text content in both.
+  if (S7_inherits(x@contents[[1]], ContentText)) {
+    content <- x@contents[[1]]@text
+    if (nchar(content) == 0) {
+      content <- "<empty>"
+    }
+  } else if (S7_inherits(x@contents[[1]], ContentJson)) {
+    # Match the existing as_json() implementation.
+    content <- "<structured data/>"
+  } else if (S7_inherits(x@contents[[1]], ContentToolResult)) {
+    # Completely undocumented, but: it seems like the model is expecting the
+    # tool result in textual format here, too -- otherwise it gets confused,
+    # like it can't see the output.
+    content <- tool_string(x@contents[[1]])
+  } else {
+    cli::cli_abort("Unsupported content type: {.cls {class(x@contents[[1]])}}.")
+  }
   list(
     role = x@role,
-    content = as_json(provider, x@contents[[1]])
+    content = content,
+    content_list = as_json(provider, x@contents)
   )
 }
 
-method(as_json, list(ProviderSnowflakeCortex, ContentText)) <- function(
+# See: https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-llm-rest-api#tools-configuration
+method(as_json, list(ProviderSnowflakeCortex, ToolDef)) <- function(
   provider,
   x
 ) {
-  x@text
+  list(
+    tool_spec = compact(list(
+      type = "generic",
+      name = x@name,
+      description = x@description,
+      input_schema = as_json(provider, x@arguments)
+    ))
+  )
+}
+
+# See: https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-llm-rest-api#tools-configuration
+method(as_json, list(ProviderSnowflakeCortex, ContentToolRequest)) <- function(
+  provider,
+  x
+) {
+  input <- x@arguments
+  if (length(input) == 0) {
+    # Snowflake requires an empty object, rather than an empty array.
+    input <- set_names(list())
+  }
+  list(
+    type = "tool_use",
+    tool_use = list(
+      tool_use_id = x@id,
+      name = x@name,
+      input = input
+    )
+  )
+}
+
+# See: https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-llm-rest-api#tool-results
+method(as_json, list(ProviderSnowflakeCortex, ContentToolResult)) <- function(
+  provider,
+  x
+) {
+  list(
+    type = "tool_results",
+    tool_results = compact(list(
+      tool_use_id = x@request@id,
+      name = x@request@name,
+      content = list(
+        list(type = "text", text = tool_string(x))
+      ),
+      # TODO: Is this the correct format?
+      status = if (tool_errored(x)) "error"
+    ))
+  )
 }
 
 # Utilities ------------------------------------------------------------------

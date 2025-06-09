@@ -23,18 +23,17 @@
 #' ## Known limitations
 #'
 #' Databricks models do not support images, but they do support structured
-#' outputs. Tool calling support is also very limited at present and is
-#' currently not supported by ellmer.
+#' outputs and tool calls for most models.
 #'
 #' @family chatbots
 #' @param workspace The URL of a Databricks workspace, e.g.
 #'   `"https://example.cloud.databricks.com"`. Will use the value of the
 #'   environment variable `DATABRICKS_HOST`, if set.
-#' @param model `r param_model("databricks-dbrx-instruct")`
+#' @param model `r param_model("databricks-claude-3-7-sonnet")`
 #'
 #'   Available foundational models include:
 #'
-#'   - `databricks-dbrx-instruct` (the default)
+#'   - `databricks-claude-3-7-sonnet` (the default)
 #'   - `databricks-mixtral-8x7b-instruct`
 #'   - `databricks-meta-llama-3-1-70b-instruct`
 #'   - `databricks-meta-llama-3-1-405b-instruct`
@@ -58,7 +57,7 @@ chat_databricks <- function(
 ) {
   check_string(workspace, allow_empty = FALSE)
   check_string(token, allow_empty = FALSE, allow_null = TRUE)
-  model <- set_default(model, "databricks-dbrx-instruct")
+  model <- set_default(model, "databricks-claude-3-7-sonnet")
   echo <- check_echo(echo)
   if (!is.null(token)) {
     credentials <- function() list(Authorization = paste("Bearer", token))
@@ -175,6 +174,39 @@ method(as_json, list(ProviderDatabricks, ContentText)) <- function(
 ) {
   # Databricks only seems to support textual content.
   x@text
+}
+
+# See: https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference#functionobject
+method(as_json, list(ProviderDatabricks, ToolDef)) <- function(provider, x) {
+  # Note: It seems that Databricks doesn't support the "strict" field, despite
+  # what their documentation says. It *is* supported for structured outputs,
+  # though. I suspect a copy & paste error in their docs.
+  compact(list(
+    type = "function",
+    "function" = compact(list(
+      name = x@name,
+      description = x@description,
+      # Use the same parameter encoding as the OpenAI provider, but only if
+      # there actually are parameters.
+      parameters = if (length(x@arguments@properties) != 0)
+        as_json(provider, x@arguments)
+    ))
+  ))
+}
+
+# https://docs.databricks.com/aws/en/machine-learning/foundation-model-apis/api-reference#toolcall
+method(as_json, list(ProviderDatabricks, ContentToolRequest)) <- function(
+  provider,
+  x
+) {
+  # Databricks seems to require encoding empty arguments as an empty
+  # dictionary, rather than an empty array.
+  json_args <- jsonlite::toJSON(set_names(x@arguments))
+  list(
+    id = x@id,
+    `function` = list(name = x@name, arguments = json_args),
+    type = "function"
+  )
 }
 
 databricks_workspace <- function(error_call = caller_env()) {
